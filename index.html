@@ -289,7 +289,13 @@ function freshState(mode) {
     loanRate: mode === "advanced" ? 0.02 : 0,  // fraction of principal per day
     dailyInterest: mode === "advanced" ? 3.0 : 0,
     equityShare: 0, equityRaised: 0,
-    missedRentDays: 0,   // consecutive days rent was skipped
+    missedRentDays: 0,
+    brandTrends: { classic:0.5, adidas:0.3, jordans:0.2, custom:0.25 },
+    brandTrendHistory: { classic:[0.5], adidas:[0.3], jordans:[0.2], custom:[0.25] },
+    hotBrand: null,            // { id, daysLeft, boost } — silent, player discovers through sales
+    nextEventDay: mode !== "beginner" ? 6+Math.floor(Math.random()*7) : null,
+    activeEvent: null,         // { type, label, daysLeft, description }
+    totalPenalties: 0,
     history: [], badges: [],
     inventory: inv, customBrand: custom,
     staged: { buy, prices, payRent:false, runAd:false },
@@ -345,6 +351,112 @@ function recentAvgProfit(days) {
   const slice = state.history.slice(-days);
   if (!slice.length) return 0;
   return slice.reduce((s,r) => s + r.yourProfit, 0) / slice.length;
+}
+
+// ── Trend arrow for a brand based on recent trend history
+function trendArrow(brandId) {
+  const hist = state.brandTrendHistory?.[brandId] || [];
+  if (hist.length < 2) return { arrow:"→", color:"#8a8474" };
+  const diff = hist[hist.length-1] - hist[hist.length-2];
+  if (diff > 0.07) return { arrow:"↑↑", color:"#1B5E20" };
+  if (diff > 0.02) return { arrow:"↑",  color:"#4CAF50" };
+  if (diff < -0.07) return { arrow:"↓↓", color:"#B3261E" };
+  if (diff < -0.02) return { arrow:"↓",  color:"#E2645A" };
+  return { arrow:"→", color:"#8a8474" };
+}
+
+// ── Apply wrong-answer cash penalty
+function applyWrongPenalty() {
+  const amt = 5;
+  state.cash = Math.max(0, state.cash - amt);
+  state.totalPenalties = (state.totalPenalties||0) + amt;
+  return amt;
+}
+
+// ── Update dynamic brand popularity each day (daily drift + hot brand + events)
+function updateBrandTrends() {
+  const base = { classic:0.5, adidas:0.3, jordans:0.2, custom:0.25 };
+  ["classic","adidas","jordans","custom"].forEach(id => {
+    let curr = state.brandTrends[id] ?? base[id];
+    // Random drift + slow mean reversion toward base popularity
+    curr = Math.max(0.04, Math.min(0.75, curr + (Math.random()-0.5)*0.06 + (base[id]-curr)*0.04));
+    state.brandTrends[id] = curr;
+    if (!state.brandTrendHistory[id]) state.brandTrendHistory[id] = [];
+    state.brandTrendHistory[id].push(curr);
+    if (state.brandTrendHistory[id].length > 8) state.brandTrendHistory[id].shift();
+  });
+  // Hot brand: silent spike, player discovers through trend arrows and sales
+  if (state.hotBrand) {
+    state.hotBrand.daysLeft--;
+    if (state.hotBrand.daysLeft <= 0) state.hotBrand = null;
+  }
+  if (!state.hotBrand && Math.random() < 0.08) {
+    const ub = unlockedBrands();
+    if (ub.length) {
+      const pick = ub[Math.floor(Math.random()*ub.length)];
+      state.hotBrand = { id:pick.id, daysLeft:3+Math.floor(Math.random()*4), boost:1.7+Math.random()*0.8 };
+      // Inject a visible jump into trend history so arrows reflect it
+      state.brandTrendHistory[pick.id].push(Math.min(0.75,(state.brandTrends[pick.id]||base[pick.id])+0.12));
+    }
+  }
+  // Events shift trends
+  if (state.activeEvent?.type === "recession") {
+    state.brandTrends.classic = Math.min(0.75, state.brandTrends.classic + 0.04);
+    state.brandTrends.jordans = Math.max(0.04, state.brandTrends.jordans - 0.04);
+  }
+  if (state.activeEvent?.type === "competition") {
+    state.brandTrends.adidas = Math.max(0.04, state.brandTrends.adidas - 0.05);
+  }
+}
+
+// ── Check and fire/expire market events (intermediate + advanced only)
+function checkMarketEvents() {
+  if (state.mode === "beginner") return;
+  if (state.activeEvent) {
+    state.activeEvent.daysLeft--;
+    if (state.activeEvent.daysLeft <= 0) {
+      state.activeEvent = null;
+      state.nextEventDay = state.day + 8 + Math.floor(Math.random()*8);
+    }
+    return;
+  }
+  if (state.nextEventDay && state.day >= state.nextEventDay) {
+    const isRecession = Math.random() < 0.55;
+    state.activeEvent = isRecession
+      ? { type:"recession",    label:"📉 Recession",       daysLeft:3+Math.floor(Math.random()*3), description:"Consumer spending is tightening. Expect 45% fewer customers and lower willingness to pay." }
+      : { type:"competition",  label:"🏪 New Competitor",  daysLeft:4+Math.floor(Math.random()*4), description:"A rival shoe store just opened nearby. Expect 30% fewer customers, especially for Adidas." };
+    state.message = { type:"eventAlert", event:state.activeEvent };
+  }
+}
+
+// ── Event meter UI — shown above brand cards in day screen
+function eventMeterEl() {
+  if (state.mode === "beginner") return null;
+  const d = document.createElement("div");
+  if (state.activeEvent) {
+    const ev = state.activeEvent;
+    d.className = "explainer red";
+    d.style.marginBottom = "14px";
+    d.innerHTML = `<b>${ev.label} in effect</b> — ${ev.daysLeft} day${ev.daysLeft===1?"":"s"} remaining<br>
+      <span style="font-size:13px;opacity:0.85;">${ev.description}</span>`;
+    return d;
+  }
+  if (!state.nextEventDay) return null;
+  const dLeft = Math.max(0, state.nextEventDay - state.day);
+  const pct   = Math.round(Math.max(0, Math.min(100, (1 - dLeft/16)*100)));
+  const col   = dLeft <= 2 ? "#E2645A" : dLeft <= 5 ? "#FF9F45" : "#4CAF50";
+  const label = dLeft <= 2 ? "🔴 Brace for impact!" : dLeft <= 5 ? "🟡 Market pressure building" : "🟢 Market stable";
+  d.style.cssText = "background:#fff;border-radius:14px;padding:12px 14px;margin-bottom:14px;border:3px solid #F1EFE4;box-shadow:0 4px 0 #E8B84B;";
+  d.innerHTML = `
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+      <span style="font-size:13px;font-weight:800;color:#5a554c;">📊 Market Stability</span>
+      <span style="font-size:12px;font-weight:800;color:${col};">${label} — ~${dLeft} day${dLeft===1?"":"s"}</span>
+    </div>
+    <div style="height:11px;background:#F1EFE4;border-radius:6px;overflow:hidden;">
+      <div style="height:100%;width:${pct}%;background:${col};border-radius:6px;"></div>
+    </div>
+    <div style="font-size:12px;color:#8a8474;margin-top:4px;">Keep cash reserves ready — market shocks can cut traffic 30-45%</div>`;
+  return d;
 }
 
 function shelfHTML(shelfId, getUnits) {
@@ -850,6 +962,10 @@ function turnaroundTracker() {
 function dayScreen() {
   const wrap = document.createElement("div");
 
+  // Market event meter (intermediate/advanced only)
+  const evMeter = eventMeterEl();
+  if (evMeter) wrap.appendChild(evMeter);
+
   // Beginner: if mandatory rent is due and player can't afford it, game over
   if (state.mode === "beginner" && state.level >= 2 && state.cash < RENT) {
     const panel = document.createElement("div");
@@ -888,7 +1004,16 @@ function dayScreen() {
   designBtn.style.fontSize = "14px";
   designBtn.textContent = state.customBrand.designed ? `🎨 Edit "${state.customBrand.name}"` : "🎨 Design Your Own Shoe";
   designBtn.onclick = () => { state.cameFrom="day"; state.designDraftName=null; state.screen="design"; render(); };
+
+  const trendsBtn = document.createElement("button");
+  trendsBtn.className = state.showTrendArrows ? "btn-green" : "btn-gray";
+  trendsBtn.style.fontSize = "14px";
+  trendsBtn.title = state.showTrendArrows ? "Demand trend arrows ON — click to hide" : "Show demand trend arrows as a hint";
+  trendsBtn.innerHTML = state.showTrendArrows ? "📊 Trends: ON" : "📊 Trends: OFF";
+  trendsBtn.onclick = () => { state.showTrendArrows = !state.showTrendArrows; render(); };
+
   actionRow.appendChild(designBtn);
+  actionRow.appendChild(trendsBtn);
 
   if (state.mode !== "beginner" || state.history.length > 0) {
     const raiseBtn = document.createElement("button");
@@ -928,10 +1053,12 @@ function dayScreen() {
     const margin = price - b.cost;
     const belowCost = price < b.cost;
     const priceMin = state.mode === "advanced" ? 1 : b.minPrice;
+    const ta = state.showTrendArrows ? trendArrow(b.id) : null;
     cardsHtml += `<div class="brand-card${belowCost?" firesale-on":""}">
       <div class="brand-card-head" style="border-color:${b.color};">
         <span class="brand-dot" style="background:${b.color}"></span>
         <span class="brand-name">${b.name}</span>
+        ${ta ? `<span style="font-weight:900;font-size:15px;color:${ta.color};margin-left:4px;" title="Demand trend">${ta.arrow}</span>` : ""}
         <span class="brand-cost">Cost ${fmt(b.cost)}/pair</span>
         ${belowCost ? `<span style="color:#E2645A;font-weight:900;font-size:13px;">🔥 FIRE SALE</span>` : ""}
       </div>
@@ -1129,11 +1256,20 @@ function simulationScreen() {
 function buildVisitors(ub, runAd) {
   let count = 5+Math.floor(Math.random()*4);
   if (runAd) count += 3+Math.floor(Math.random()*3);
-  const tw = ub.reduce((s,b)=>s+b.popularity,0);
+  if (state.activeEvent?.type === "recession")   count = Math.max(2, Math.round(count*0.55));
+  if (state.activeEvent?.type === "competition") count = Math.max(2, Math.round(count*0.70));
+  const weighted = ub.map(b => {
+    let pop = state.brandTrends?.[b.id] ?? b.popularity;
+    if (state.hotBrand?.id === b.id) pop *= state.hotBrand.boost;
+    return { brand:b, pop };
+  });
+  const tw = weighted.reduce((s,w)=>s+w.pop,0);
+  const wMult = state.activeEvent?.type === "recession" ? 0.78 : 1;
   return Array.from({length:count}, ()=>{
-    let r=Math.random()*tw, chosen=ub[ub.length-1];
-    for(const b of ub){if(r<b.popularity){chosen=b;break;}r-=b.popularity;}
-    return {brand:chosen, willingness:Math.round(chosen.minPrice-5+Math.random()*(chosen.maxPrice-chosen.minPrice+20)), wantsQty:Math.random()<chosen.bulkChance?2:1};
+    let r=Math.random()*tw, chosen=weighted[weighted.length-1].brand;
+    for(const w of weighted){if(r<w.pop){chosen=w.brand;break;}r-=w.pop;}
+    const willingness=Math.round((chosen.minPrice-5+Math.random()*(chosen.maxPrice-chosen.minPrice+20))*wMult);
+    return {brand:chosen, willingness, wantsQty:Math.random()<chosen.bulkChance?2:1};
   });
 }
 
@@ -1247,7 +1383,7 @@ function finalizeDay(dayPlan, sim) {
 // ─────────────────────────────────────────────
 function pickQuizType(){
   const opts=["profit"];
-  if(state.level>=3) opts.push("cash");
+  if(state.level>=3) opts.push("netCashChange");
   if(state.level>=4) opts.push("equity");
   if(state.mode==="intermediate"&&state.equityShare>0) opts.push("equityPayment");
   const weighted=["profit","profit",...opts.filter(o=>o!=="profit")];
@@ -1290,6 +1426,19 @@ function quizScreen(){
       <p class="sub">Your investor owns <b>${Math.round(state.equityShare*100)}%</b> of your profits.</p>
       <p class="sub" style="font-weight:800;">${Math.round(state.equityShare*100)}% of ${fmt(r.netProfit)} = ?</p>`;
     correctAnswer=r.equityPayment;
+  } else if(q.type==="netCashChange"){
+    const cashLines=[
+      `<li>Revenue from sales: <b>+${fmt(r.revenue)}</b></li>`,
+      `<li>Inventory bought: <b>−${fmt(r.buyTotalCost)}</b></li>`,
+      r.billsTotal?`<li>Rent &amp; ads: <b>−${fmt(r.billsTotal)}</b></li>`:"",
+      r.interestExpense?`<li>Loan interest: <b>−${fmt(r.interestExpense)}</b></li>`:"",
+      r.equityPayment?`<li>Equity investor: <b>−${fmt(r.equityPayment)}</b></li>`:"",
+    ].filter(Boolean).join("");
+    promptHtml=`<h2>🧮 How much did your cash change today?</h2>
+      <p class="sub">Don't look at the top bar — calculate it yourself:</p>
+      <ul style="margin:6px 0 12px 20px;font-size:15px;line-height:1.9;">${cashLines}</ul>
+      <p class="sub" style="font-weight:800;">Net cash change = Revenue − all outflows. What's the total?</p>`;
+    correctAnswer=Math.round(r.revenue-r.buyTotalCost-r.billsTotal-(r.interestExpense||0)-(r.equityPayment||0));
   }
 
   panel.innerHTML=`${promptHtml}<div style="display:flex;align-items:center;gap:10px;margin-top:10px;"><span style="font-size:24px;font-weight:900;">$</span><input type="number" id="quizInput" placeholder="0" class="quiz-input" ${q.submitted?"disabled":""}></div>`;
@@ -1298,7 +1447,8 @@ function quizScreen(){
     const el=document.getElementById("quizInput");
     const val=el?el.value.trim():"";
     const ua=val===""?null:Number(val);
-    q.userAnswer=ua; q.correct=ua!==null&&!isNaN(ua)&&Math.round(ua)===Math.round(correctAnswer); q.submitted=true;
+    const tol=Math.max(2,Math.abs(correctAnswer)*0.01);
+    q.userAnswer=ua; q.correct=ua!==null&&!isNaN(ua)&&Math.abs(ua-correctAnswer)<=tol; q.submitted=true;
     render();
   }
 
@@ -1361,15 +1511,18 @@ function mkPanel(emoji,title,contentEl){
 function advanceDay(){
   state.day+=1; state.screen="day";
   checkLevelUp();
+  checkMarketEvents();
+  updateBrandTrends();
   if(!state.message && state.day>=state.nextInvestorDay){
     state.screen="valuationQuiz";
     state.nextInvestorDay=state.day+5;
     const recent=state.history.slice(-5);
     const avgProfit=recent.reduce((s,r)=>s+r.yourProfit,0)/Math.max(1,recent.length);
-    const annualProfit=Math.round(avgProfit*250); // ~250 selling days/year
+    const avgProfitR=Math.round(avgProfit);        // whole dollar — what the player sees
+    const annualProfit=avgProfitR*250;             // consistent: $X/day × 250 = annual
     state.valuationQuiz={
       step:1,
-      avgProfit:Math.round(avgProfit),
+      avgProfit:avgProfitR,
       annualProfit,
       fairLow:Math.round(annualProfit*2),  // 2× annual — low end for small retail
       fairHigh:Math.round(annualProfit*4), // 4× annual — high end for small retail
@@ -1585,7 +1738,7 @@ function valuationQuizScreen(){
       checkBtn.onclick=()=>{
         const el=document.getElementById("vqInput");
         const val=el?Number(el.value):0;
-        const ok=Math.abs(Math.round(val)-sd.correct)<=1;
+        const tol=Math.max(2,Math.abs(sd.correct)*0.01); const ok=Math.abs(val-sd.correct)<=tol;
         vq.answers[vq.step]=val; vq.submitted[vq.step]=true; vq.correct[vq.step]=ok;
         render();
       };
@@ -1746,6 +1899,17 @@ function modalEl(msg){
     box.innerHTML=`<div class="big-emoji">🔒</div><h2>You've Been Evicted!</h2>
       <p style="font-size:16px;line-height:1.5;margin:10px 0;">You skipped rent two days in a row. The landlord locked up the store. This is exactly why cash management matters — even when money is tight, some bills can't wait.</p>
       <div class="explainer warn" style="margin-top:10px;">💡 Real businesses sometimes negotiate payment plans, but if you ignore the landlord entirely — this happens!</div>`;
+  } else if(msg.type==="eventAlert"){
+    const ev=msg.event;
+    const isRecession=ev.type==="recession";
+    box.innerHTML=`<div class="big-emoji">${isRecession?"📉":"🏪"}</div>
+      <h2>${ev.label}</h2>
+      <p style="font-size:16px;line-height:1.5;margin:10px 0;">${ev.description}</p>
+      <div class="explainer warn" style="margin-top:10px;">
+        ${isRecession
+          ? "💡 During a recession, cheaper brands hold up better. Watch which products customers are still buying — and hold onto cash."
+          : "💡 A competitor just opened nearby. <b>Running an ad today can cut the traffic loss from 30% down to ~8%</b> — it brings customers back to you instead. Watch which brands stop selling and adjust your stock."}
+      </div>`;
   } else if(msg.type==="confirmHome"){
     box.innerHTML=`<div class="big-emoji">🏠</div><h2>Go back to the home screen?</h2>
       <p style="font-size:16px;line-height:1.5;margin:10px 0;">Your current game progress will be lost. Are you sure?</p>`;
